@@ -47,7 +47,7 @@ const config = {
 
   // ─── Curve Tracker ────────────────────────────
   enableCurveTracker: process.env.ENABLE_CURVE_TRACKER !== 'false',
-  curveTargetProgress: parseFloat(process.env.CURVE_TARGET_PROGRESS || '10'),
+  curveTargetProgress: parseFloat(process.env.CURVE_TARGET_PROGRESS || '1'),
   curveCheckInterval: parseInt(process.env.CURVE_CHECK_INTERVAL || '3000'),
   curveMaxWaitMs: parseInt(process.env.CURVE_MAX_WAIT_MS || '120000'),
 
