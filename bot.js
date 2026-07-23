@@ -50,7 +50,7 @@ function ts() {
 const rpcManager = new RpcManager({
   rpcEndpoint: config.rpcEndpoint,
   rpcWs: config.rpcWs,
-  heliusApiKey: process.env.HELIUS_API_KEY || '',
+  heliusApiKey: config.heliusApiKey,
 });
 const connection = rpcManager.getConnection(); // Keep for compatibility — rpcManager auto-retries
 
@@ -777,17 +777,23 @@ async function startTokenDetector() {
 
 // ─── Polling Detector ──────────────────────────
 let polledTokens = new Set();
+// Cap how many getTransaction calls we make per polling cycle to avoid 429 spam
+const POLL_MAX_TX_FETCHES = 3;
 async function startPollingDetector() {
-  log.info('🔄 Backup polling detector (every 5s)...');
+  log.info('🔄 Backup polling detector (every 10s)...');
 
   setInterval(async () => {
     try {
       const sigs = await rpcManager.getSignaturesForAddress(
         new solanaWeb3.PublicKey(config.pumpProgramId),
-        { limit: 20 }
+        { limit: 10 }
       );
 
+      let fetchedThisCycle = 0;
       for (const sigInfo of sigs) {
+        // Stop fetching if we've hit the per-cycle cap
+        if (fetchedThisCycle >= POLL_MAX_TX_FETCHES) break;
+
         if (polledTokens.has(sigInfo.signature)) continue;
         polledTokens.add(sigInfo.signature);
 
@@ -795,6 +801,7 @@ async function startPollingDetector() {
           commitment: 'confirmed',
           maxSupportedTransactionVersion: 0,
         });
+        fetchedThisCycle++;
 
         if (tx && tx.meta && !tx.meta.err && tx.meta.postTokenBalances) {
           for (const tb of tx.meta.postTokenBalances) {
@@ -808,10 +815,16 @@ async function startPollingDetector() {
           }
         }
       }
+
+      // Prune the seen-set so it doesn't grow forever (keep last 500)
+      if (polledTokens.size > 500) {
+        const arr = Array.from(polledTokens);
+        polledTokens = new Set(arr.slice(-500));
+      }
     } catch (e) {
       log.error('Polling error:', e.message);
     }
-  }, 5000);
+  }, 10000);
 }
 
 // ─── Position Monitor Loop ────────────────────
