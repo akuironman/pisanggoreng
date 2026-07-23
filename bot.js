@@ -11,6 +11,7 @@ const TelegramNotifier = require('./telegram');
 const JitoEngine = require('./jito');
 const RpcManager = require('./rpc-manager');
 const CurveTracker = require('./curve-tracker');
+const PumpBuyEngine = require('./pump-buy');
 
 // ─── bs58 — support both v5 (cjs) and v6 (esm) ──
 let bs58;
@@ -92,6 +93,13 @@ const curveTracker = new CurveTracker({
   checkInterval: config.curveCheckInterval,
   maxWaitMs: config.curveMaxWaitMs,
   pumpProgramId: config.pumpProgramId,
+});
+
+// ─── Direct Pump.fun Buy Engine ────────────────
+const pumpBuy = new PumpBuyEngine({
+  rpcManager,
+  walletKeypair,
+  logger: log,
 });
 
 // ─── State ────────────────────────────────────
@@ -407,17 +415,40 @@ async function buyToken(mintAddress) {
     const WSOL = 'So11111111111111111111111111111111111111112';
     log.info(`🎯 BUY ${config.buyAmountSol} SOL → ${mintAddress.slice(0,12)}...`);
 
-    const result = await buildSwapTx(WSOL, mintAddress, config.buyAmountSol);
-    if (!result) {
-      log.warn('BUY: Could not build swap tx');
-      return false;
+    // ─── DIRECT PUMP.FUN BUY ────────────────
+    // For Pump.fun tokens (ending in 'pump') — buy direct from bonding curve
+    const isPumpToken = mintAddress.endsWith('pump') || mintAddress.length === 44;
+    let sig = null;
+    let tokenAmount = 0;
+
+    if (config.enablePumpDirectBuy && isPumpToken) {
+      log.info(`🔄 Buying directly from Pump.fun bonding curve...`);
+      sig = await pumpBuy.executeBuy(mintAddress, config.buyAmountSol);
+      if (sig) {
+        // Wait & check balance
+        await sleep(3000);
+        const tb = await getTokenBalance(mintAddress);
+        tokenAmount = tb.amount;
+        if (tokenAmount <= 0) {
+          log.warn('PumpBuy: Balance 0 after tx — falling back to Jupiter');
+          sig = null;
+        } else {
+          log.success(`✅ PumpBuy got ${tokenAmount.toFixed(4)} tokens`);
+        }
+      }
     }
 
-    const sig = await executeTx(result.tx, 'BUY');
-    if (!sig) return false;
-
-    // Wait for settlement
-    await sleep(3000);
+    // ─── JUPITER FALLBACK ────────────────────
+    if (!sig) {
+      const result = await buildSwapTx(WSOL, mintAddress, config.buyAmountSol);
+      if (!result) {
+        log.warn('BUY: Could not build swap tx');
+        return false;
+      }
+      sig = await executeTx(result.tx, 'BUY');
+      if (!sig) return false;
+      await sleep(3000);
+    }
 
     // Check balance
     const tokenBal = await getTokenBalance(mintAddress);
