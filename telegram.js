@@ -3,8 +3,7 @@
 // ============================================
 // Sends trade alerts, TP hits, errors to Telegram
 // ============================================
-
-const fetch = require('node-fetch');
+// Node 22 built-in fetch
 
 class TelegramNotifier {
   constructor(config) {

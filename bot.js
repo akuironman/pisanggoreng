@@ -642,20 +642,28 @@ async function startTokenDetector() {
   const initialBal = await getSolBalance();
   log.info(`💰 Initial Balance: ${initialBal.toFixed(4)} SOL ($${(initialBal * _cachedSolPrice).toFixed(2)})`);
 
-  // Telegram onStart notification
-  await telegram.onStart({
-    walletAddress,
-    balanceSol: initialBal.toFixed(4),
-    balanceUsd: (initialBal * _cachedSolPrice).toFixed(2),
-    tpUsd: config.tpUsd,
-    stopLossUsd: config.stopLossUsd,
-    buyAmountSol: config.buyAmountSol,
-    slippage: config.slippage,
-    antiScam: config.enableAntiScam,
-    partialTp: config.enablePartialTp,
-    partialSellPct: config.partialSellPct,
-    rpcEndpoint: config.rpcEndpoint,
-  });
+  // Telegram onStart notification + test
+  if (config.telegramEnabled) {
+    log.info(`📱 Testing Telegram connection...`);
+    const testResult = await telegram.onStart({
+      walletAddress,
+      balanceSol: initialBal.toFixed(4),
+      balanceUsd: (initialBal * _cachedSolPrice).toFixed(2),
+      tpUsd: config.tpUsd,
+      stopLossUsd: config.stopLossUsd,
+      buyAmountSol: config.buyAmountSol,
+      slippage: config.slippage,
+      antiScam: config.enableAntiScam,
+      partialTp: config.enablePartialTp,
+      partialSellPct: config.partialSellPct,
+      rpcEndpoint: config.rpcEndpoint,
+    });
+    if (testResult) {
+      log.success(`✅ Telegram connected — check your chat!`);
+    } else {
+      log.warn(`⚠️ Telegram message send failed. Check TELEGRAM_BOT_TOKEN & TELEGRAM_CHAT_ID in .env`);
+    }
+  }
 
   // Listen to Pump.fun logs
   const pumpProgramId = new solanaWeb3.PublicKey(config.pumpProgramId);
