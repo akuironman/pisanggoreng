@@ -18,6 +18,7 @@ const config = {
 
   // ─── Jupiter ─────────────────────────────────
   jupiterApi: process.env.JUPITER_API || 'https://quote-api.jup.ag/v6',
+  jupiterApiFallback: process.env.JUPITER_API_FALLBACK || 'https://api.jup.ag/v6',
 
   // ─── Helius RPC ──────────────────────────────
   heliusApiKey: process.env.HELIUS_API_KEY || '',

@@ -194,32 +194,56 @@ async function getSolPrice() {
   return _cachedSolPrice;
 }
 
-// ─── Jupiter Fetch with Retry ──────────────────
-async function jupiterFetch(url, options = {}, maxRetries = 3) {
+// ─── Jupiter API Fallback ──────────────────────
+const JUPITER_ENDPOINTS = [
+  config.jupiterApi,                                    // primary: quote-api.jup.ag
+  config.jupiterApiFallback,                            // fallback: api.jup.ag
+  'https://api.jup.ag',                                 // hardcoded fallback
+];
+
+// ─── Jupiter Fetch with Retry + Fallback ────────
+async function jupiterFetch(url, options = {}, maxRetries = 2) {
+  // Extract base URL from the original URL to try fallback
+  const originalUrl = typeof url === 'string' ? url : url.url;
+
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const resp = await fetch(url, options);
-      if (resp.status === 429) {
-        const wait = Math.min(1000 * Math.pow(2, attempt), 8000);
-        log.warn(`🌐 Jupiter 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
-        await new Promise(r => setTimeout(r, wait));
-        continue;
+    for (const endpoint of JUPITER_ENDPOINTS) {
+      const fallbackUrl = originalUrl.replace(config.jupiterApi, endpoint);
+      if (fallbackUrl === originalUrl && attempt > 0) continue; // already tried
+      try {
+        const resp = await fetch(fallbackUrl, options);
+        if (resp.status === 429) {
+          const wait = Math.min(1000 * Math.pow(2, attempt), 8000);
+          log.warn(`🌐 Jupiter 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
+          await new Promise(r => setTimeout(r, wait));
+          break; // break inner loop, retry outer
+        }
+        if (!resp.ok && resp.status >= 500) {
+          const wait = 2000;
+          log.warn(`🌐 Jupiter ${resp.status}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
+          await new Promise(r => setTimeout(r, wait));
+          break;
+        }
+        return resp;
+      } catch (e) {
+        const msg = e.message ? e.message.toLowerCase() : '';
+        // DNS / connection error — try next endpoint
+        if (msg.includes('fetch failed') || msg.includes('enotfound') || msg.includes('dns') || msg.includes('econnrefused') || msg.includes('econnreset') || msg.includes('timeout')) {
+          log.warn(`🌐 Jupiter endpoint ${new URL(fallbackUrl).hostname} failed: ${e.message.slice(0,50)}`);
+          continue; // try next endpoint in list
+        }
+        if (attempt < maxRetries - 1) {
+          const wait = 2000;
+          log.warn(`🌐 Jupiter fetch error: ${e.message.slice(0, 50)}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
+          await new Promise(r => setTimeout(r, wait));
+          break;
+        }
+        throw e;
       }
-      if (!resp.ok && resp.status >= 500) {
-        const wait = 2000;
-        log.warn(`🌐 Jupiter ${resp.status}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
-        await new Promise(r => setTimeout(r, wait));
-        continue;
-      }
-      return resp;
-    } catch (e) {
-      if (attempt < maxRetries - 1) {
-        const wait = 2000;
-        log.warn(`🌐 Jupiter fetch error: ${e.message.slice(0, 60)}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
-        await new Promise(r => setTimeout(r, wait));
-        continue;
-      }
-      throw e;
+    }
+    // If all endpoints tried and none worked, wait before retry
+    if (attempt < maxRetries - 1) {
+      await new Promise(r => setTimeout(r, 2000));
     }
   }
   return null;
@@ -644,10 +668,18 @@ async function startTokenDetector() {
             'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // Token Program
             'ATokenGPvbdGVxr1b2hvZbsiqW5xr25ix9fJf9WjJvdEG', // ATA Program
             'ComputeBudget111111111111111111111111111111', // Compute Budget
+            '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun Program
+            '675kPX9MHTjS2zt1i4bBcGvjgL2LzV3FKJ',            // Raydium V4
+            '5Q544fKrFoe6sEb8z6vZz8TsKixKQnZQZV',            // Pump.fun Fee Account
+            'pAMM18rG6JciqSAnMHBfA5CGhLGwR3x7K5',            // Raydium AMM
+            'PZRi9cBaiHHqKL8mCQptZY8G84ZqKtXPn1',            // Raydium PZ
           ];
           if (knownNonTokens.includes(potentialMint)) return;
           // Also filter: must not start with all-1 pattern
           if (/^1{10,}/.test(potentialMint)) return;
+          // Filter: if matched address is the SAME as pumpProgramId or raydiumProgramId
+          if (potentialMint === config.pumpProgramId) return;
+          if (potentialMint === config.raydiumV4ProgramId) return;
           const eventKey = `${ctx.slot}-${potentialMint}`;
 
           // DEDUP — skip if we already processed this event
