@@ -1,12 +1,14 @@
 // ============================================
-// GMGN SNIPER BOT — CORE ENGINE
-// Auto-detect tokens → Buy → TP $5 → Sell → Loop
+// PISANGGORENG v2.0 — GMGN SNIPER BOT
+// Anti-Scam + Telegram + Partial TP + Moonbag
 // ============================================
 const solanaWeb3 = require('@solana/web3.js');
 const { getAssociatedTokenAddress } = require('@solana/spl-token');
 const bs58 = require('bs58');
 const config = require('./config');
-// Node 22 built-in fetch — no import needed
+const AntiScam = require('./anti-scam');
+const TelegramNotifier = require('./telegram');
+// Node 22 built-in fetch
 
 // ─── Logger ───────────────────────────────────
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };
@@ -33,22 +35,46 @@ const connection = new solanaWeb3.Connection(config.rpcEndpoint, {
 const walletKeypair = solanaWeb3.Keypair.fromSecretKey(
   bs58.decode(config.privateKey)
 );
-console.log(`👛 Wallet: ${walletKeypair.publicKey.toBase58()}`);
-console.log(`💰 Balance: fetching...`);
+const walletAddress = walletKeypair.publicKey.toBase58();
+console.log(`👛 Wallet: ${walletAddress}`);
+
+// ─── Anti-Scam Engine ─────────────────────────
+const antiScam = new AntiScam(connection);
+
+// ─── Telegram Notifier ────────────────────────
+const telegram = new TelegramNotifier({
+  enabled: config.telegramEnabled,
+  botToken: config.telegramBotToken,
+  chatId: config.telegramChatId,
+  useMarkdown: true,
+});
 
 // ─── State ────────────────────────────────────
-const activePositions = new Map(); // mint -> { mint, entryPrice, entrySol, buyTx, tokenAccount, time }
+const activePositions = new Map(); // mint -> Position
+const closedTrades = [];
 let lastTradeTime = 0;
+let stats = { totalTrades: 0, tpHit: 0, slHit: 0, scamsBlocked: 0, pnl: 0 };
 
-// ─── Helpers ──────────────────────────────────
-function delay(ms) {
-  return new Promise(r => setTimeout(r, ms));
+// ─── Position Class ──────────────────────────
+class Position {
+  constructor(mint, entrySol, tokenAmount, entryPriceUsd, buyTx) {
+    this.mint = mint;
+    this.entrySol = entrySol;
+    this.tokenAmount = tokenAmount;
+    this.entryPriceUsd = entryPriceUsd;
+    this.buyTx = buyTx;
+    this.time = Date.now();
+    this.sold = false;
+    this.partialSold = false;     // true if partial TP triggered
+    this.moonbagActive = false;   // true if holding moonbag
+    this.highestValue = entryPriceUsd * tokenAmount;
+  }
 }
 
+// ─── Helpers ──────────────────────────────────
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
-
 
 // ─── Get SOL Balance ──────────────────────────
 async function getSolBalance() {
@@ -61,7 +87,7 @@ async function getSolBalance() {
   }
 }
 
-// ─── Get Token Balance (UI amount) ────────────
+// ─── Get Token Balance ────────────────────────
 async function getTokenBalance(mintAddress) {
   try {
     const mint = new solanaWeb3.PublicKey(mintAddress);
@@ -78,18 +104,47 @@ async function getTokenBalance(mintAddress) {
 // ─── Get Token Price from Jupiter ─────────────
 async function getTokenPrice(mintAddress) {
   try {
+    const WSOL = 'So11111111111111111111111111111111111111112';
+    // Quote 1M lamports worth — using 0.001 SOL equivalent (harder for very cheap tokens)
     const resp = await fetch(
-      `${config.jupiterApi}/quote?inputMint=${mintAddress}&outputMint=So11111111111111111111111111111111111111112&amount=1000000&slippageBps=${config.slippage * 100}`
+      `${config.jupiterApi}/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=10000&slippageBps=${config.slippage * 100}`
     );
     if (!resp.ok) return null;
     const data = await resp.json();
     if (!data || !data.outAmount) return null;
+
+    // Route info
     const outSol = parseFloat(data.outAmount) / solanaWeb3.LAMPORTS_PER_SOL;
-    const pricePerToken = outSol / (1000000 / 10 ** 6); // rough
     const solPrice = await getSolPrice();
-    return pricePerToken * solPrice;
+    // Price per token = SOL received / 10000 (the quoted amount in smallest units)
+    // This is very rough — we use the actual balance value calc later
+    return solPrice; // We return SOL price and use compare method instead
   } catch (e) {
     return null;
+  }
+}
+
+// ─── Get Position Value in USD ────────────────
+async function getPositionValueUsd(mintAddress, tokenAmount) {
+  try {
+    if (tokenAmount <= 0) return 0;
+    const WSOL = 'So11111111111111111111111111111111111111112';
+    // Use slightly more for accuracy
+    const inputAmount = Math.max(1, Math.floor(tokenAmount * 1000000));
+    const resp = await fetch(
+      `${config.jupiterApi}/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=${inputAmount}&slippageBps=${config.slippage * 100}`
+    );
+    if (!resp.ok) return 0;
+    const data = await resp.json();
+    if (!data || !data.outAmount) return 0;
+
+    const outSol = parseFloat(data.outAmount) / solanaWeb3.LAMPORTS_PER_SOL;
+    const factor = tokenAmount / (inputAmount / 1000000);
+    const totalSol = outSol * factor;
+    const solPrice = await getSolPrice();
+    return totalSol * solPrice;
+  } catch (e) {
+    return 0;
   }
 }
 
@@ -112,8 +167,19 @@ async function getSolPrice() {
 // ─── Build Jupiter Swap Tx ────────────────────
 async function buildSwapTx(inputMint, outputMint, amount, isExactOut = false) {
   try {
+    // For SELLING tokens: amount is already in human units, need smallest units
+    // For BUYING with SOL: amount is in SOL, convert to lamports
+    const isSolInput = inputMint === 'So11111111111111111111111111111111111111112';
+    let amountLamports;
+    if (isSolInput) {
+      amountLamports = Math.floor(amount * solanaWeb3.LAMPORTS_PER_SOL);
+    } else {
+      // Token output — we already have it in token units, but need to figure out decimals
+      // Use 1M as base and let Jupiter route
+      amountLamports = Math.floor(amount * 1000000);
+    }
+
     const slippageBps = Math.floor(config.slippage * 100);
-    const amountLamports = Math.floor(amount * solanaWeb3.LAMPORTS_PER_SOL);
 
     // Quote
     const quoteParams = new URLSearchParams({
@@ -140,7 +206,7 @@ async function buildSwapTx(inputMint, outputMint, amount, isExactOut = false) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         quoteResponse: quote,
-        userPublicKey: walletKeypair.publicKey.toBase58(),
+        userPublicKey: walletAddress,
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
         prioritizationFeeLamports: {
@@ -176,10 +242,11 @@ async function executeTx(tx, label = 'tx') {
     log.debug(`${label} sent: ${sig}`);
 
     // Wait for confirmation
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('processed');
     const confirm = await connection.confirmTransaction({
       signature: sig,
-      blockhash: (await connection.getLatestBlockhash()).blockhash,
-      lastValidBlockHeight: (await connection.getLatestBlockhash('processed')).lastValidBlockHeight,
+      blockhash,
+      lastValidBlockHeight,
     }, 'confirmed');
 
     if (confirm.value.err) {
@@ -203,17 +270,28 @@ async function buyToken(mintAddress) {
       await sleep(wait);
     }
 
+    // ─── ANTI-SCAM CHECK ─────────────────────
+    if (config.enableAntiScam) {
+      log.info(`🛡️ Scanning ${mintAddress.slice(0,12)}... for scams...`);
+      const scanResult = await antiScam.scan(mintAddress, config);
+      if (!scanResult.pass) {
+        log.warn(`🚫 BLOCKED: ${scanResult.reason}`);
+        stats.scamsBlocked++;
+        await telegram.onScamBlock(mintAddress, scanResult.reason);
+        return false;
+      }
+      log.success(`✅ Anti-scam passed: ${scanResult.reason}`);
+    }
+
     // Check SOL balance
     const solBalance = await getSolBalance();
-    const needed = config.buyAmountSol * 1.05; // 5% buffer for fees
+    const needed = config.buyAmountSol * 1.05;
     if (solBalance < needed) {
       log.error(`Insufficient SOL: ${solBalance.toFixed(4)} (need ${needed.toFixed(4)})`);
       return false;
     }
 
-    const mint = new solanaWeb3.PublicKey(mintAddress);
     const WSOL = 'So11111111111111111111111111111111111111112';
-
     log.info(`🎯 BUY ${config.buyAmountSol} SOL → ${mintAddress.slice(0,12)}...`);
 
     const result = await buildSwapTx(WSOL, mintAddress, config.buyAmountSol);
@@ -225,13 +303,13 @@ async function buyToken(mintAddress) {
     const sig = await executeTx(result.tx, 'BUY');
     if (!sig) return false;
 
-    // Wait a bit for balances to settle
+    // Wait for settlement
     await sleep(3000);
 
     // Check balance
     const tokenBal = await getTokenBalance(mintAddress);
     if (tokenBal.amount <= 0) {
-      log.warn('BUY: Token balance is 0 after tx — may be a scam or failed');
+      log.warn('BUY: Token balance is 0 after tx');
       return false;
     }
 
@@ -239,21 +317,29 @@ async function buyToken(mintAddress) {
     const solPrice = await getSolPrice();
     const entryPriceUsd = (config.buyAmountSol * solPrice) / tokenBal.amount;
 
-    const position = {
-      mint: mintAddress,
+    const position = new Position(
+      mintAddress,
+      config.buyAmountSol,
+      tokenBal.amount,
       entryPriceUsd,
-      entrySol: config.buyAmountSol,
-      tokenAmount: tokenBal.amount,
-      buyTx: sig,
-      time: Date.now(),
-      sold: false,
-    };
+      sig
+    );
 
     activePositions.set(mintAddress, position);
     lastTradeTime = Date.now();
+    stats.totalTrades++;
 
     log.success(`BOUGHT ${mintAddress.slice(0,12)}... | Tokens: ${tokenBal.amount.toFixed(2)} | Entry: $${entryPriceUsd.toFixed(8)}`);
     log.trade(`Buy TX: https://solscan.io/tx/${sig}`);
+
+    await telegram.onBuy(
+      mintAddress,
+      tokenBal.amount,
+      config.buyAmountSol,
+      entryPriceUsd,
+      sig,
+      config.enableAntiScam ? 'Scam check passed' : null
+    );
 
     return true;
   } catch (e) {
@@ -263,85 +349,138 @@ async function buyToken(mintAddress) {
 }
 
 // ─── SELL ─────────────────────────────────────
-async function sellToken(mintAddress, position) {
+async function sellToken(mintAddress, position, amountOverride = null, label = 'SELL') {
   try {
-    const tokenBal = await getTokenBalance(mintAddress);
-    if (tokenBal.amount <= 0) {
-      log.warn(`SELL: No tokens to sell for ${mintAddress.slice(0,12)}...`);
-      position.sold = true;
+    let tokenBal;
+    if (amountOverride) {
+      tokenBal = { amount: amountOverride, decimals: 0, ata: null };
+    } else {
+      tokenBal = await getTokenBalance(mintAddress);
+    }
+
+    const actualAmount = amountOverride || tokenBal.amount;
+    if (actualAmount <= 0) {
+      log.warn(`${label}: No tokens to sell for ${mintAddress.slice(0,12)}...`);
+      if (!amountOverride) position.sold = true;
       return false;
     }
 
-    const actualAmount = tokenBal.amount;
     const WSOL = 'So11111111111111111111111111111111111111112';
+    log.info(`💰 ${label} ${actualAmount.toFixed(4)} tokens → SOL`);
 
-    log.info(`💰 SELL ${actualAmount.toFixed(4)} tokens → SOL`);
-
+    // Build with smaller unit estimation
     const result = await buildSwapTx(mintAddress, WSOL, actualAmount);
     if (!result) {
-      log.warn('SELL: Could not build swap tx — trying exact out');
-      // Try alternative: sell a fixed small amount
-      const altResult = await buildSwapTx(mintAddress, WSOL, actualAmount * 0.99);
+      // Try with a smaller amount
+      const altResult = await buildSwapTx(mintAddress, WSOL, actualAmount * 0.9);
       if (!altResult) return false;
-      const sig = await executeTx(altResult.tx, 'SELL');
+      const sig = await executeTx(altResult.tx, label);
       if (!sig) return false;
-      position.sold = true;
-      log.success(`SOLD ${mintAddress.slice(0,12)}... | TX: https://solscan.io/tx/${sig}`);
-      return true;
+      return sig;
     }
 
-    const sig = await executeTx(result.tx, 'SELL');
+    const sig = await executeTx(result.tx, label);
     if (!sig) return false;
 
-    position.sold = true;
-    log.success(`SOLD ${mintAddress.slice(0,12)}... ✅`);
-    log.trade(`Sell TX: https://solscan.io/tx/${sig}`);
-
-    return true;
+    return sig;
   } catch (e) {
-    log.error('sellToken error:', e.message);
+    log.error(`${label} error:`, e.message);
     return false;
   }
 }
 
-// ─── Monitor Position — TP $5 → Sell ─────────
+// ─── Monitor Position — TP/SL/Moonbag Logic ───
 async function monitorPosition(mintAddress, position) {
   try {
     const tokenBal = await getTokenBalance(mintAddress);
     if (tokenBal.amount <= 0 || position.sold) {
-      if (!position.sold) {
+      if (!position.sold && tokenBal.amount <= 0) {
         log.warn(`Position ${mintAddress.slice(0,12)}... has 0 tokens, marking sold`);
         position.sold = true;
       }
       return;
     }
 
-    // Get current price estimate
-    const solPrice = await getSolPrice();
-    const tokenPrice = await getTokenPrice(mintAddress);
+    // Get current position value
+    const currentValueUsd = await getPositionValueUsd(mintAddress, tokenBal.amount);
+    if (currentValueUsd <= 0) return;
 
-    if (tokenPrice === null) {
-      log.debug(`No price for ${mintAddress.slice(0,12)}... yet`);
+    const entryValueUsd = position.entrySol * _cachedSolPrice;
+    const profit = currentValueUsd - entryValueUsd;
+    const profitPct = ((currentValueUsd / entryValueUsd) - 1) * 100;
+
+    // Track highest value for trailing stop
+    if (currentValueUsd > position.highestValue) {
+      position.highestValue = currentValueUsd;
+    }
+
+    log.debug(`${mintAddress.slice(0,12)}... | Value: $${currentValueUsd.toFixed(2)} | PnL: $${profit.toFixed(2)} (${profitPct.toFixed(1)}%) | Tokens: ${tokenBal.amount.toFixed(2)}`);
+
+    // ─── CHECK STOP LOSS ─────────────────────
+    if (config.stopLossUsd > 0 && profit <= -config.stopLossUsd) {
+      log.trade(`🔴 SL HIT! Loss $${Math.abs(profit).toFixed(2)} >= $${config.stopLossUsd} — Selling ALL`);
+      stats.slHit++;
+      const sig = await sellToken(mintAddress, position, null, 'SELL(SL)');
+      if (sig) {
+        position.sold = true;
+        stats.pnl += profit;
+        await telegram.onSell(mintAddress, profit, profitPct, currentValueUsd, sig);
+      }
       return;
     }
 
-    const currentValue = tokenPrice * tokenBal.amount;
-    const profit = currentValue - (position.entryPriceUsd * tokenBal.amount);
-    const profitPct = ((currentValue / (position.entryPriceUsd * tokenBal.amount)) - 1) * 100;
+    // ─── PARTIAL TP LOGIC ────────────────────
+    if (config.enablePartialTp && !position.partialSold && profit >= config.tpUsd) {
+      log.trade(`🚀 TP $${config.tpUsd} HIT! Profit $${profit.toFixed(2)} — Selling ${config.partialSellPct}%`);
 
-    log.debug(`${mintAddress.slice(0,12)}... | Value: $${currentValue.toFixed(2)} | PnL: $${profit.toFixed(2)} (${profitPct.toFixed(1)}%)`);
+      const sellAmount = tokenBal.amount * (config.partialSellPct / 100);
+      const sig = await sellToken(mintAddress, position, sellAmount, 'SELL(TP)');
+      if (sig) {
+        position.partialSold = true;
+        stats.tpHit++;
+        stats.pnl += config.tpUsd; // rough
 
-    // Check TP
-    if (profit >= config.tpUsd) {
-      log.trade(`🚀 TP HIT! Profit $${profit.toFixed(2)} >= $${config.tpUsd} — Selling NOW`);
-      await sellToken(mintAddress, position);
-      return true;
+        await telegram.onTpHit(mintAddress, profit, profitPct, currentValueUsd);
+
+        // ─── MOONBAG ─────────────────────────
+        if (config.moonbagHoldPct > 0) {
+          position.moonbagActive = true;
+          const moonbagTokens = tokenBal.amount * (config.moonbagHoldPct / 100);
+          // We already sold partial, recalc — the remaining balance is the moonbag
+          log.trade(`🌙 Moonbag active! Holding ${config.moonbagHoldPct}% for $${config.moonbagTpUsd} TP`);
+        }
+
+        log.success(`✅ Partial TP executed. Remaining position: moonbag active`);
+      }
+      return;
     }
 
-    return false;
+    // ─── MOONBAG SELL ───────────────────────
+    if (position.moonbagActive && !position.sold) {
+      if (profit >= config.moonbagTpUsd) {
+        log.trade(`🌙 MOONBAG TP HIT! Profit $${profit.toFixed(2)} >= $${config.moonbagTpUsd} — Selling remainder`);
+        const sig = await sellToken(mintAddress, position, null, 'SELL(MOONBAG)');
+        if (sig) {
+          position.sold = true;
+          stats.pnl += profit;
+          await telegram.onSell(mintAddress, profit, profitPct, currentValueUsd, sig);
+        }
+        return;
+      }
+
+      // Also sell moonbag if it drops below entry to prevent loss
+      if (profit <= -config.tpUsd && config.stopLossUsd > 0) {
+        log.trade(`🌙 Moonbag stop triggered — selling remainder at break-even`);
+        const sig = await sellToken(mintAddress, position, null, 'SELL(MOONBAG-STOP)');
+        if (sig) {
+          position.sold = true;
+          await telegram.onSell(mintAddress, profit, profitPct, currentValueUsd, sig);
+        }
+      }
+    }
+
   } catch (e) {
     log.error('monitorPosition error:', e.message);
-    return false;
   }
 }
 
@@ -355,123 +494,99 @@ async function monitorAllPositions() {
     }
     await monitorPosition(mint, pos);
   }
-  // Cleanup sold positions
   for (const mint of closed) {
     activePositions.delete(mint);
     log.success(`🧹 Cleaned up ${mint.slice(0,12)}... from active positions`);
   }
 }
 
-// ─── Detect New Tokens (Pump.fun Log Listener) ─
+// ─── Detect New Tokens ─────────────────────────
 async function startTokenDetector() {
-  log.info('🚀 Starting GMGN Sniper Bot...');
+  log.info('🚀 Starting PISANGGORENG SNIPER BOT v2.0...');
   log.info(`📡 RPC: ${config.rpcEndpoint}`);
   log.info(`💵 TP: $${config.tpUsd} per entry`);
+  if (config.stopLossUsd > 0) log.info(`🔴 SL: $${config.stopLossUsd}`);
+  if (config.enablePartialTp) {
+    log.info(`📊 Partial TP: Sell ${config.partialSellPct}% at TP, hold ${config.moonbagHoldPct}% moonbag for $${config.moonbagTpUsd}`);
+  }
+  log.info(`🛡️ Anti-scam: ${config.enableAntiScam ? 'ON' : 'OFF'}`);
+  log.info(`📱 Telegram: ${config.telegramEnabled ? 'ON' : 'OFF'}`);
   log.info(`💸 Buy amount: ${config.buyAmountSol} SOL`);
   log.info(`⏱️  Cooldown: ${config.cooldownMs}ms`);
   log.info('─────────────────────────────────────────');
-  log.info('👀 Listening for new Pump.fun tokens...');
 
-  // Get SOL price once
   await getSolPrice();
   log.info(`💵 SOL/USD: $${_cachedSolPrice}`);
 
-  // Log initial balance
   const initialBal = await getSolBalance();
   log.info(`💰 Initial Balance: ${initialBal.toFixed(4)} SOL ($${(initialBal * _cachedSolPrice).toFixed(2)})`);
 
-  // APPROACH 1: Subscribe to program logs (Pump.fun)
-  // We watch for create + initialize events
+  // Telegram onStart notification
+  await telegram.onStart({
+    walletAddress,
+    balanceSol: initialBal.toFixed(4),
+    balanceUsd: (initialBal * _cachedSolPrice).toFixed(2),
+    tpUsd: config.tpUsd,
+    stopLossUsd: config.stopLossUsd,
+    buyAmountSol: config.buyAmountSol,
+    slippage: config.slippage,
+    antiScam: config.enableAntiScam,
+    partialTp: config.enablePartialTp,
+    partialSellPct: config.partialSellPct,
+    rpcEndpoint: config.rpcEndpoint,
+  });
+
+  // Listen to Pump.fun logs
   const pumpProgramId = new solanaWeb3.PublicKey(config.pumpProgramId);
-  let subscriptionId = null;
 
   try {
-    subscriptionId = connection.onLogs(
+    const subscriptionId = connection.onLogs(
       pumpProgramId,
       async (logs, ctx) => {
         if (logs.err) return;
-
         const logStr = logs.logs.join(' ');
 
-        // Detect new token creation — Pump.fun "create" events
-        // Typical signatures: "Program log: Create", "initialize2", "Program log: Instruction: Create"
         if (logStr.includes('Program log: Create') ||
             logStr.includes('initialize2') ||
             logStr.includes('Program log: initialize')) {
 
           log.info(`🔥 New token detected at slot ${ctx.slot}!`);
 
-          // Extract token mint from logs (Pump.fun specific parsing)
-          const mintMatch = logStr.match(/mint:\s*([1-9A-HJ-NP-Za-km-z]{32,44})/) ||
-                           logStr.match(/([1-9A-HJ-NP-Za-km-z]{32,44})/);
-
-          if (!mintMatch) {
-            log.debug('Could not extract mint from logs — trying by parsing keys...');
-            // Try to get recent transactions to find the token
-            await sleep(500);
-            const recentSigs = await connection.getSignaturesForAddress(
-              pumpProgramId,
-              { limit: 10 }
-            );
-            if (recentSigs.length > 0) {
-              log.info(`📄 Found ${recentSigs.length} recent txs — scanning for new mints...`);
-              for (const sigInfo of recentSigs.slice(0, 3)) {
-                try {
-                  const tx = await connection.getTransaction(sigInfo.signature, {
-                    commitment: 'confirmed',
-                    maxSupportedTransactionVersion: 0,
-                  });
-                  if (tx && tx.meta && !tx.meta.err) {
-                    // Check post-token balances for new token accounts
-                    if (tx.meta.postTokenBalances) {
-                      for (const tb of tx.meta.postTokenBalances) {
-                        if (tb.owner === walletKeypair.publicKey.toBase58() && tb.mint) {
-                          log.info(`🎯 Found new token mint: ${tb.mint}`);
-                          // Check if already in positions
-                          if (!activePositions.has(tb.mint)) {
-                            await buyToken(tb.mint);
-                          }
-                          return;
-                        }
-                      }
-                    }
-                  }
-                } catch (e) {}
-              }
-            }
-            return;
-          }
+          // Extract mint from logs
+          const mintMatch = logStr.match(/([1-9A-HJ-NP-Za-km-z]{32,44})/);
+          if (!mintMatch) return;
 
           const potentialMint = mintMatch[1];
-          if (!activePositions.has(potentialMint)) {
-            await sleep(500); // Give the token time to populate
-            const exists = await connection.getAccountInfo(new solanaWeb3.PublicKey(potentialMint));
-            if (exists) {
-              log.info(`🎯 Token mint found: ${potentialMint}`);
-              await buyToken(potentialMint);
-            }
+          if (!activePositions.has(potentialMint) && potentialMint !== 'So11111111111111111111111111111111111111112') {
+            // Check it's a valid mint
+            try {
+              new solanaWeb3.PublicKey(potentialMint);
+              await sleep(800);
+              const exists = await connection.getAccountInfo(new solanaWeb3.PublicKey(potentialMint));
+              if (exists) {
+                log.info(`🎯 Token mint confirmed: ${potentialMint}`);
+                await buyToken(potentialMint);
+              }
+            } catch (e) {}
           }
         }
       },
       'processed'
     );
 
-    log.success(`✅ Listening on Pump.fun via logs — subscription ID: ${subscriptionId}`);
-
+    log.success(`✅ Listening on Pump.fun logs (ID: ${subscriptionId})`);
   } catch (e) {
-    log.error('Failed to subscribe to program logs:', e.message);
-    log.info('⚠️  Falling back to polling mode...');
+    log.error('WebSocket subscription failed:', e.message);
+    log.info('⚠️  Falling back to polling...');
   }
 
-  // APPROACH 2: Alternate detector via recent transactions polling
-  // This catches tokens we might have missed via logs
   startPollingDetector();
 }
 
-// ─── Polling Detector (Fallback) ──────────────
+// ─── Polling Detector ──────────────────────────
 let polledTokens = new Set();
 async function startPollingDetector() {
-  log.info('🔄 Starting backup polling detector (every 5s)...');
+  log.info('🔄 Backup polling detector (every 5s)...');
 
   setInterval(async () => {
     try {
@@ -484,23 +599,21 @@ async function startPollingDetector() {
         if (polledTokens.has(sigInfo.signature)) continue;
         polledTokens.add(sigInfo.signature);
 
-        try {
-          const tx = await connection.getTransaction(sigInfo.signature, {
-            commitment: 'confirmed',
-            maxSupportedTransactionVersion: 0,
-          });
+        const tx = await connection.getTransaction(sigInfo.signature, {
+          commitment: 'confirmed',
+          maxSupportedTransactionVersion: 0,
+        });
 
-          if (tx && tx.meta && !tx.meta.err && tx.meta.postTokenBalances) {
-            for (const tb of tx.meta.postTokenBalances) {
-              if (tb.mint &&
-                  !activePositions.has(tb.mint) &&
-                  tb.mint !== 'So11111111111111111111111111111111111111112') {
-                log.info(`🔍 [POLL] Found new token via polling: ${tb.mint}`);
-                await buyToken(tb.mint);
-              }
+        if (tx && tx.meta && !tx.meta.err && tx.meta.postTokenBalances) {
+          for (const tb of tx.meta.postTokenBalances) {
+            if (tb.mint &&
+                !activePositions.has(tb.mint) &&
+                tb.mint !== 'So11111111111111111111111111111111111111112') {
+              log.info(`🔍 [POLL] Found: ${tb.mint}`);
+              await buyToken(tb.mint);
             }
           }
-        } catch (e) {}
+        }
       }
     } catch (e) {
       log.error('Polling error:', e.message);
@@ -510,14 +623,13 @@ async function startPollingDetector() {
 
 // ─── Position Monitor Loop ────────────────────
 async function startPositionMonitor() {
-  log.info('📊 Starting position monitor (every 10s)...');
+  log.info('📊 Position monitor (every 10s)...');
 
   setInterval(async () => {
     if (activePositions.size === 0) {
-      // Show status every 30s even when idle
       const bal = await getSolBalance();
       const solPrice = await getSolPrice();
-      log.debug(`💤 Idle — ${bal.toFixed(4)} SOL ($${(bal * solPrice).toFixed(2)}) | ${activePositions.size} active positions`);
+      log.debug(`💤 Idle — ${bal.toFixed(4)} SOL ($${(bal * solPrice).toFixed(2)}) | ${activePositions.size} active`);
       return;
     }
 
@@ -526,20 +638,37 @@ async function startPositionMonitor() {
   }, 10000);
 }
 
+// ─── Daily Summary ─────────────────────────────
+function startDailySummary() {
+  // Send a summary every 24h
+  setInterval(async () => {
+    const bal = await getSolBalance();
+    const solPrice = await getSolPrice();
+    await telegram.onDailySummary({
+      totalTrades: stats.totalTrades,
+      tpHit: stats.tpHit,
+      slHit: stats.slHit,
+      scamsBlocked: stats.scamsBlocked,
+      pnl: stats.pnl,
+      balanceSol: bal,
+      balanceUsd: bal * solPrice,
+    });
+  }, 24 * 60 * 60 * 1000);
+}
+
 // ─── Main ─────────────────────────────────────
 async function main() {
   console.log('');
-  console.log('╔═══════════════════════════════════════╗');
-  console.log('║      🚀 GMGN SNIPER BOT v1.0          ║');
-  console.log('║   Auto Trade | TP $5 | Cycle Loop      ║');
-  console.log('╚═══════════════════════════════════════╝');
+  console.log('╔═══════════════════════════════════════════╗');
+  console.log('║    🍳 PISANGGORENG SNIPER v2.0            ║');
+  console.log('║    Anti-Scam • Telegram • Partial TP      ║');
+  console.log('╚═══════════════════════════════════════════╝');
   console.log('');
 
-  // Start all modules
   startTokenDetector();
   startPositionMonitor();
+  startDailySummary();
 
-  // Keep alive signal
   console.log('');
   console.log('✅ BOT RUNNING — Press Ctrl+C to stop');
   console.log('');
@@ -560,10 +689,14 @@ process.on('SIGINT', async () => {
     }
   }
 
-  // Show final balance
+  // Show final stats
   const bal = await getSolBalance();
   const solPrice = await getSolPrice();
   console.log(`💰 Final Balance: ${bal.toFixed(4)} SOL ($${(bal * solPrice).toFixed(2)})`);
+  console.log(`📊 Stats: ${stats.totalTrades} trades | ${stats.tpHit} TP | ${stats.slHit} SL | ${stats.scamsBlocked} scams blocked`);
+
+  // Telegram summary
+  await telegram.onTradeSummary([...activePositions.values()]);
   console.log('👋 Goodbye!');
   process.exit(0);
 });
