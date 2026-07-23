@@ -19,6 +19,9 @@ const config = {
   // ─── Jupiter ─────────────────────────────────
   jupiterApi: process.env.JUPITER_API || 'https://quote-api.jup.ag/v6',
 
+  // ─── Helius RPC ──────────────────────────────
+  heliusApiKey: process.env.HELIUS_API_KEY || '',
+
   // ─── Trading ─────────────────────────────────
   buyAmountSol: parseFloat(process.env.BUY_AMOUNT_SOL || '0.01'),
   cooldownMs: parseInt(process.env.COOLDOWN_MS || '2000'),

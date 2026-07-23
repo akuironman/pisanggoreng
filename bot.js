@@ -8,6 +8,7 @@ const config = require('./config');
 const AntiScam = require('./anti-scam');
 const TelegramNotifier = require('./telegram');
 const JitoEngine = require('./jito');
+const RpcManager = require('./rpc-manager');
 
 // ─── bs58 — support both v5 (cjs) and v6 (esm) ──
 let bs58;
@@ -42,11 +43,13 @@ function ts() {
   return new Date().toISOString().replace('T',' ').slice(0,19);
 }
 
-// ─── Solana Connection ────────────────────────
-const connection = new solanaWeb3.Connection(config.rpcEndpoint, {
-  wsEndpoint: config.rpcWs,
-  commitment: 'processed',
+// ─── Solana Connection (RPC Manager with auto-rotate) ─
+const rpcManager = new RpcManager({
+  rpcEndpoint: config.rpcEndpoint,
+  rpcWs: config.rpcWs,
+  heliusApiKey: process.env.HELIUS_API_KEY || '',
 });
+const connection = rpcManager.getConnection(); // Keep for compatibility — rpcManager auto-retries
 
 // ─── Wallet ───────────────────────────────────
 const walletKeypair = solanaWeb3.Keypair.fromSecretKey(
@@ -56,7 +59,7 @@ const walletAddress = walletKeypair.publicKey.toBase58();
 console.log(`👛 Wallet: ${walletAddress}`);
 
 // ─── Anti-Scam Engine ─────────────────────────
-const antiScam = new AntiScam(connection);
+const antiScam = new AntiScam(rpcManager);
 
 // ─── Telegram Notifier ────────────────────────
 const telegram = new TelegramNotifier({
@@ -106,7 +109,7 @@ function sleep(ms) {
 // ─── Get SOL Balance ──────────────────────────
 async function getSolBalance() {
   try {
-    const bal = await connection.getBalance(walletKeypair.publicKey);
+    const bal = await rpcManager.getBalance(walletKeypair.publicKey);
     return bal / solanaWeb3.LAMPORTS_PER_SOL;
   } catch (e) {
     log.error('Failed to fetch SOL balance:', e.message);
@@ -119,7 +122,7 @@ async function getTokenBalance(mintAddress) {
   try {
     const mint = new solanaWeb3.PublicKey(mintAddress);
     const ata = await getAssociatedTokenAddress(mint, walletKeypair.publicKey);
-    const balance = await connection.getTokenAccountBalance(ata);
+    const balance = await rpcManager.getTokenAccountBalance(ata);
     const amount = parseFloat(balance.value.uiAmountString || '0');
     const decimals = balance.value.decimals;
     return { amount, decimals, ata };
@@ -274,16 +277,16 @@ async function executeTx(tx, label = 'tx') {
 
   // ─── REGULAR SEND PATH ────────────────────
   try {
-    const sig = await connection.sendTransaction(tx, {
+    const sig = await rpcManager.sendTransaction(tx, {
       skipPreflight: false,
-      preflightCommitment: 'processed',
+      preflightCommitment: 'confirmed',
       maxRetries: 3,
     });
     log.debug(`${label} sent: ${sig}`);
 
     // Wait for confirmation
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('processed');
-    const confirm = await connection.confirmTransaction({
+    const { blockhash, lastValidBlockHeight } = await rpcManager.getLatestBlockhash('confirmed');
+    const confirm = await rpcManager.confirmTransaction({
       signature: sig,
       blockhash,
       lastValidBlockHeight,
@@ -580,8 +583,11 @@ async function startTokenDetector() {
   // Listen to Pump.fun logs
   const pumpProgramId = new solanaWeb3.PublicKey(config.pumpProgramId);
 
+  // Dedup detector — prevents same token flooding
+  const detectedEvents = new Set();
+
   try {
-    const subscriptionId = connection.onLogs(
+    const subscriptionId = rpcManager.onLogs(
       pumpProgramId,
       async (logs, ctx) => {
         if (logs.err) return;
@@ -591,21 +597,31 @@ async function startTokenDetector() {
             logStr.includes('initialize2') ||
             logStr.includes('Program log: initialize')) {
 
-          log.info(`🔥 New token detected at slot ${ctx.slot}!`);
-
-          // Extract mint from logs
+          // Extract mint
           const mintMatch = logStr.match(/([1-9A-HJ-NP-Za-km-z]{32,44})/);
           if (!mintMatch) return;
 
           const potentialMint = mintMatch[1];
+          const eventKey = `${ctx.slot}-${potentialMint}`;
+
+          // DEDUP — skip if we already processed this event
+          if (detectedEvents.has(eventKey)) return;
+          detectedEvents.add(eventKey);
+          // Clean old entries after 1000
+          if (detectedEvents.size > 1000) {
+            const first = detectedEvents.values().next().value;
+            detectedEvents.delete(first);
+          }
+
+          log.info(`🔥 New token: ${potentialMint.slice(0,12)}... (slot ${ctx.slot})`);
+
           if (!activePositions.has(potentialMint) && potentialMint !== 'So11111111111111111111111111111111111111112') {
-            // Check it's a valid mint
             try {
               new solanaWeb3.PublicKey(potentialMint);
               await sleep(800);
-              const exists = await connection.getAccountInfo(new solanaWeb3.PublicKey(potentialMint));
+              const exists = await rpcManager.getAccountInfo(new solanaWeb3.PublicKey(potentialMint));
               if (exists) {
-                log.info(`🎯 Token mint confirmed: ${potentialMint}`);
+                log.info(`🎯 Token confirmed: ${potentialMint}`);
                 await buyToken(potentialMint);
               }
             } catch (e) {}
@@ -631,7 +647,7 @@ async function startPollingDetector() {
 
   setInterval(async () => {
     try {
-      const sigs = await connection.getSignaturesForAddress(
+      const sigs = await rpcManager.getSignaturesForAddress(
         new solanaWeb3.PublicKey(config.pumpProgramId),
         { limit: 20 }
       );
@@ -640,7 +656,7 @@ async function startPollingDetector() {
         if (polledTokens.has(sigInfo.signature)) continue;
         polledTokens.add(sigInfo.signature);
 
-        const tx = await connection.getTransaction(sigInfo.signature, {
+        const tx = await rpcManager.getTransaction(sigInfo.signature, {
           commitment: 'confirmed',
           maxSupportedTransactionVersion: 0,
         });
