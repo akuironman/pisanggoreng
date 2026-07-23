@@ -100,11 +100,17 @@ class RpcManager {
           continue;
         }
 
-        // Connection error — rotate immediately
-        if (msg.includes('fetch failed') || msg.includes('socket') || msg.includes('timeout') || msg.includes('ETIMEDOUT')) {
+        // Connection error — rotate immediately (but NOT "account not found")
+        if ((msg.includes('fetch failed') || msg.includes('socket') || msg.includes('timeout') || msg.includes('ETIMEDOUT') || msg.includes('ECONNRESET')) &&
+            !msg.includes('account') && !msg.includes('Account')) {
           console.warn(`[RPC] 🔌 Connection error: ${msg.slice(0, 60)}... rotating`);
           this.rotate();
           continue;
+        }
+
+        // "Account not found" or similar — just throw normally
+        if (msg.includes('failed to get info about account') || msg.includes('account not found') || msg.includes('AccountNotFound')) {
+          throw e; // Normal RPC error, not connection issue
         }
 
         // Non-recoverable — throw
