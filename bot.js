@@ -96,6 +96,7 @@ const curveTracker = new CurveTracker({
 
 // ─── State ────────────────────────────────────
 const activePositions = new Map(); // mint -> Position
+const pendingMints = new Set();    // mints currently in buy flow (prevents race)
 const closedTrades = [];
 let lastTradeTime = 0;
 let stats = { totalTrades: 0, tpHit: 0, slHit: 0, scamsBlocked: 0, pnl: 0 };
@@ -333,19 +334,24 @@ async function executeTx(tx, label = 'tx') {
 
 // ─── BUY ──────────────────────────────────────
 async function buyToken(mintAddress) {
+  let wasPending = false;
   try {
     // ─── MAX 1 POSITION ──────────────────────
     if (config.maxOnePosition) {
-      // Count non-sold positions
+      // Check BOTH active positions AND pending buys (avoid race condition)
       let activeCount = 0;
       for (const [, pos] of activePositions) {
         if (!pos.sold) activeCount++;
       }
-      if (activeCount >= 1) {
-        log.info(`⏭️ Max 1 position active (${activeCount}) — skipping ${mintAddress.slice(0,12)}...`);
+      if (activeCount >= 1 || pendingMints.size >= 1) {
+        log.info(`⏭️ Max 1 position — skipping ${mintAddress.slice(0,12)}... (active: ${activeCount}, pending: ${pendingMints.size})`);
         return false;
       }
     }
+
+    // Mark as pending immediately — prevents concurrent buys
+    pendingMints.add(mintAddress);
+    wasPending = true;
 
     // Cooldown check
     if (Date.now() - lastTradeTime < config.cooldownMs) {
@@ -452,6 +458,12 @@ async function buyToken(mintAddress) {
   } catch (e) {
     log.error('buyToken error:', e.message);
     return false;
+  } finally {
+    // Always clean up pending marker — baik sukses, gagal, atau error
+    if (wasPending && pendingMints.has(mintAddress)) {
+      pendingMints.delete(mintAddress);
+      log.debug(`🧹 Removed ${mintAddress.slice(0,12)}... from pending mints`);
+    }
   }
 }
 
