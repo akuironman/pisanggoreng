@@ -11,8 +11,8 @@ const SYSTEM_PROGRAM = solanaWeb3.SystemProgram.programId;
 const TOKEN_PROGRAM = new solanaWeb3.PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
 const RENT_PROGRAM = new solanaWeb3.PublicKey('SysvarRent111111111111111111111111111111111');
 const ASSOC_TOKEN_PROGRAM = new solanaWeb3.PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xr25ix9fJf9WjJvdEG');
-const PUMP_AUTHORITY = new solanaWeb3.PublicKey('CeAuBvTBYBi5pLcGP7CMNk9dHzxUj5N99RYL7mL86DJf');
-const PUMP_FEE_ACCOUNT = new solanaWeb3.PublicKey('5Q544fKrFoe6sEb8z6vZz8TsKixKQnZQZV');
+const PUMP_AUTHORITY = new solanaWeb3.PublicKey('4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf');
+const PUMP_FEE_ACCOUNT = new solanaWeb3.PublicKey('62TcAT7vXNJd16VNuLxgYgShQbLkKtsdbLCsQzvoE7Fq');
 const PUMP_EVENT_AUTHORITY = new solanaWeb3.PublicKey('3URBjy26nfTgkUJBuU6DCmJsWHEPibLaSfmE7RsogwTT');
 
 class PumpBuyEngine {
