@@ -174,7 +174,7 @@ async function getSolPrice() {
   return _cachedSolPrice;
 }
 
-// ─── Build Jupiter Swap Tx (via SDK) ───────────
+// ─── Build Jupiter Swap Tx (via SDK v6) ────────
 async function buildSwapTx(inputMint, outputMint, amount) {
   try {
     const isSolInput = inputMint === 'So11111111111111111111111111111111111111112';
@@ -198,35 +198,84 @@ async function buildSwapTx(inputMint, outputMint, amount) {
       return null;
     }
 
-    // 2. Get swap instructions via SDK
-    const swapResult = await jupiterClient.swapInstructionsPost({
+    // 2. Get swap instructions via SDK (returns components, not assembled tx)
+    const instructions = await jupiterClient.swapInstructionsPost({
       swapRequest: {
         quoteResponse: quote,
         userPublicKey: walletAddress,
         wrapAndUnwrapSol: true,
         dynamicComputeUnitLimit: true,
-        prioritizationFeeLamports: {
-          computeUnitLimit: 200000,
-          priorityLevel: 'veryHigh',
-        },
       },
     });
-    if (!swapResult || !swapResult.swapTransaction) {
+
+    if (!instructions || !instructions.swapInstruction) {
       log.warn('Jupiter swap-instructions failed');
       return null;
     }
 
-    // 3. Reconstruct transaction
-    const tx = solanaWeb3.VersionedTransaction.deserialize(
-      Buffer.from(swapResult.swapTransaction, 'base64')
-    );
+    // 3. Assemble VersionedTransaction from instruction components
+    const { blockhash } = await rpcManager.getLatestBlockhash('confirmed');
+
+    // Collect all instructions in order: setup → swap → cleanup
+    const allInstructions = [
+      ...(instructions.computeBudgetInstructions?.map(i => toV0Instruction(i)) || []),
+      ...(instructions.setupInstructions?.map(i => toV0Instruction(i)) || []),
+      ...(instructions.otherInstructions?.map(i => toV0Instruction(i)) || []),
+      toV0Instruction(instructions.swapInstruction),
+      ...(instructions.cleanupInstruction ? [toV0Instruction(instructions.cleanupInstruction)] : []),
+    ];
+
+    // Load address lookup tables
+    const lookupTableKeys = instructions.addressLookupTableAddresses || [];
+    const addressLookupTableAccounts = [];
+    for (const key of lookupTableKeys) {
+      try {
+        const acctInfo = await rpcManager.getAccountInfo(new solanaWeb3.PublicKey(key));
+        if (acctInfo) {
+          addressLookupTableAccounts.push({
+            key: new solanaWeb3.PublicKey(key),
+            state: solanaWeb3.AddressLookupTableAccount.deserialize(acctInfo.data),
+          });
+        }
+      } catch (e) {
+        log.debug(`LUT lookup failed for ${key.slice(0,8)}...`);
+      }
+    }
+
+    // Build V0 message
+    const message = solanaWeb3.MessageV0.compile({
+      payerKey: walletKeypair.publicKey,
+      recentBlockhash: blockhash,
+      instructions: allInstructions,
+      addressLookupTableAccounts,
+    });
+
+    const tx = new solanaWeb3.VersionedTransaction(message);
     tx.sign([walletKeypair]);
 
     return { tx, quote };
   } catch (e) {
-    log.error('buildSwapTx error:', e.message.slice(0,100));
+    let errMsg = e.message || String(e);
+    // Try to get more detail
+    if (e.response?.data) errMsg += ' | ' + JSON.stringify(e.response.data).slice(0,100);
+    log.error('buildSwapTx error:', errMsg.slice(0,150));
     return null;
   }
+}
+
+/**
+ * Convert a Jupiter SDK instruction object to TransactionInstruction
+ */
+function toV0Instruction(jupInstruction) {
+  return {
+    programId: new solanaWeb3.PublicKey(jupInstruction.programId),
+    accounts: (jupInstruction.accounts || []).map(acc => ({
+      pubkey: new solanaWeb3.PublicKey(acc.pubkey),
+      isSigner: acc.isSigner || false,
+      isWritable: acc.isWritable || false,
+    })),
+    data: Buffer.from(jupInstruction.data, 'base64'),
+  };
 }
 
 // ─── Execute Transaction ──────────────────────
