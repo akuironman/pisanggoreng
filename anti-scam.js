@@ -4,10 +4,12 @@
 // Checks before buying: honeypot, freeze, mint, liquidity
 // ============================================
 const solanaWeb3 = require('@solana/web3.js');
+const { createJupiterApiClient } = require('@jup-ag/api');
 
 class AntiScam {
   constructor(connection) {
     this.connection = connection;
+    this._jupiterClient = createJupiterApiClient();
   }
 
   /**
@@ -122,18 +124,18 @@ class AntiScam {
   async checkLiquidity(mintAddress) {
     try {
       const WSOL = 'So11111111111111111111111111111111111111112';
-      // Try a tiny 0.001 SOL buy quote — if it returns, there's some liquidity
-      const resp = await this._fetchWithRetry(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${WSOL}&outputMint=${mintAddress}&amount=1000000&slippageBps=1500`
-      );
-      if (!resp || !resp.ok) return { pass: false, reason: 'No route / liquidity (Jupiter returned ' + (resp ? resp.status : 'timeout') + ')' };
-      const data = await resp.json();
-      if (!data || !data.outAmount || parseFloat(data.outAmount) <= 0) {
+      const quote = await this._jupiterClient.quoteGet({
+        inputMint: WSOL,
+        outputMint: mintAddress,
+        amount: 1000000,
+        slippageBps: 1500,
+      });
+      if (!quote || !quote.outAmount || parseFloat(quote.outAmount) <= 0) {
         return { pass: false, reason: 'Zero output — no liquidity' };
       }
-      return { pass: true, reason: `Has liquidity ✓ (${data.routePlan?.length || 1} hop(s))` };
+      return { pass: true, reason: `Has liquidity ✓ (${quote.routePlan?.length || 1} hop(s))` };
     } catch (e) {
-      return { pass: true, reason: `Check skipped (${e.message})` };
+      return { pass: true, reason: `Check skipped (${e.message.slice(0,60)})` };
     }
   }
 
@@ -168,18 +170,18 @@ class AntiScam {
   async checkHoneypot(mintAddress) {
     try {
       const WSOL = 'So11111111111111111111111111111111111111112';
-      // Tiny sell: 0.000001 token
-      const resp = await this._fetchWithRetry(
-        `https://quote-api.jup.ag/v6/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=1&slippageBps=1500`
-      );
-      if (!resp || !resp.ok) return { pass: false, reason: 'Sell quote failed — possible honeypot' };
-      const data = await resp.json();
-      if (!data || !data.outAmount || parseFloat(data.outAmount) <= 0) {
+      const quote = await this._jupiterClient.quoteGet({
+        inputMint: mintAddress,
+        outputMint: WSOL,
+        amount: 1,
+        slippageBps: 1500,
+      });
+      if (!quote || !quote.outAmount || parseFloat(quote.outAmount) <= 0) {
         return { pass: false, reason: 'Sell returns 0 SOL — honeypot suspected' };
       }
       return { pass: true, reason: 'Sell verified ✓' };
     } catch (e) {
-      return { pass: true, reason: `Check skipped (${e.message})` };
+      return { pass: true, reason: `Check skipped (${e.message.slice(0,60)})` };
     }
   }
 }

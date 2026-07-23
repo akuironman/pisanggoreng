@@ -4,6 +4,7 @@
 // ============================================
 const solanaWeb3 = require('@solana/web3.js');
 const { getAssociatedTokenAddress } = require('@solana/spl-token');
+const { createJupiterApiClient } = require('@jup-ag/api');
 const config = require('./config');
 const AntiScam = require('./anti-scam');
 const TelegramNotifier = require('./telegram');
@@ -57,6 +58,9 @@ const walletKeypair = solanaWeb3.Keypair.fromSecretKey(
 );
 const walletAddress = walletKeypair.publicKey.toBase58();
 console.log(`👛 Wallet: ${walletAddress}`);
+
+// ─── Jupiter API Client (SDK — no DNS issues) ──
+const jupiterClient = createJupiterApiClient();
 
 // ─── Anti-Scam Engine ─────────────────────────
 const antiScam = new AntiScam(rpcManager);
@@ -131,45 +135,21 @@ async function getTokenBalance(mintAddress) {
   }
 }
 
-// ─── Get Token Price from Jupiter ─────────────
-async function getTokenPrice(mintAddress) {
+// ─── Get Token Value in USD (via Jupiter SDK) ──
+async function getTokenValueUsd(mintAddress, tokenAmount) {
+  if (tokenAmount <= 0) return 0;
   try {
     const WSOL = 'So11111111111111111111111111111111111111112';
-    // Quote 1M lamports worth — using 0.001 SOL equivalent (harder for very cheap tokens)
-    const resp = await jupiterFetch(
-      `${config.jupiterApi}/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=10000&slippageBps=${config.slippage * 100}`
-    );
-    if (!resp || !resp.ok) return null;
-    const data = await resp.json();
-    if (!data || !data.outAmount) return null;
-
-    // Route info
-    const outSol = parseFloat(data.outAmount) / solanaWeb3.LAMPORTS_PER_SOL;
-    const solPrice = await getSolPrice();
-    // Price per token = SOL received / 10000 (the quoted amount in smallest units)
-    // This is very rough — we use the actual balance value calc later
-    return solPrice; // We return SOL price and use compare method instead
-  } catch (e) {
-    return null;
-  }
-}
-
-// ─── Get Position Value in USD ────────────────
-async function getPositionValueUsd(mintAddress, tokenAmount) {
-  try {
-    if (tokenAmount <= 0) return 0;
-    const WSOL = 'So11111111111111111111111111111111111111112';
-    // Use slightly more for accuracy
-    const inputAmount = Math.max(1, Math.floor(tokenAmount * 1000000));
-    const resp = await jupiterFetch(
-      `${config.jupiterApi}/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=${inputAmount}&slippageBps=${config.slippage * 100}`
-    );
-    if (!resp || !resp.ok) return 0;
-    const data = await resp.json();
-    if (!data || !data.outAmount) return 0;
-
-    const outSol = parseFloat(data.outAmount) / solanaWeb3.LAMPORTS_PER_SOL;
-    const factor = tokenAmount / (inputAmount / 1000000);
+    const amount = Math.max(1, Math.floor(tokenAmount * 1000000));
+    const quote = await jupiterClient.quoteGet({
+      inputMint: mintAddress,
+      outputMint: WSOL,
+      amount: amount,
+      slippageBps: Math.floor(config.slippage * 100),
+    });
+    if (!quote || !quote.outAmount) return 0;
+    const outSol = parseFloat(quote.outAmount) / solanaWeb3.LAMPORTS_PER_SOL;
+    const factor = tokenAmount / (amount / 1000000);
     const totalSol = outSol * factor;
     const solPrice = await getSolPrice();
     return totalSol * solPrice;
@@ -184,8 +164,8 @@ let _lastSolPriceFetch = 0;
 async function getSolPrice() {
   if (Date.now() - _lastSolPriceFetch < 30000) return _cachedSolPrice;
   try {
-    const resp = await jupiterFetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
-    if (resp && resp.ok) {
+    const resp = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
+    if (resp.ok) {
       const data = await resp.json();
       _cachedSolPrice = data.solana.usd;
       _lastSolPriceFetch = Date.now();
@@ -194,102 +174,33 @@ async function getSolPrice() {
   return _cachedSolPrice;
 }
 
-// ─── Jupiter API Fallback ──────────────────────
-const JUPITER_ENDPOINTS = [
-  config.jupiterApi,                                    // primary: quote-api.jup.ag
-  config.jupiterApiFallback,                            // fallback: api.jup.ag
-  'https://api.jup.ag',                                 // hardcoded fallback
-];
-
-// ─── Jupiter Fetch with Retry + Fallback ────────
-async function jupiterFetch(url, options = {}, maxRetries = 2) {
-  // Extract base URL from the original URL to try fallback
-  const originalUrl = typeof url === 'string' ? url : url.url;
-
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    for (const endpoint of JUPITER_ENDPOINTS) {
-      const fallbackUrl = originalUrl.replace(config.jupiterApi, endpoint);
-      if (fallbackUrl === originalUrl && attempt > 0) continue; // already tried
-      try {
-        const resp = await fetch(fallbackUrl, options);
-        if (resp.status === 429) {
-          const wait = Math.min(1000 * Math.pow(2, attempt), 8000);
-          log.warn(`🌐 Jupiter 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
-          await new Promise(r => setTimeout(r, wait));
-          break; // break inner loop, retry outer
-        }
-        if (!resp.ok && resp.status >= 500) {
-          const wait = 2000;
-          log.warn(`🌐 Jupiter ${resp.status}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
-          await new Promise(r => setTimeout(r, wait));
-          break;
-        }
-        return resp;
-      } catch (e) {
-        const msg = e.message ? e.message.toLowerCase() : '';
-        // DNS / connection error — try next endpoint
-        if (msg.includes('fetch failed') || msg.includes('enotfound') || msg.includes('dns') || msg.includes('econnrefused') || msg.includes('econnreset') || msg.includes('timeout')) {
-          log.warn(`🌐 Jupiter endpoint ${new URL(fallbackUrl).hostname} failed: ${e.message.slice(0,50)}`);
-          continue; // try next endpoint in list
-        }
-        if (attempt < maxRetries - 1) {
-          const wait = 2000;
-          log.warn(`🌐 Jupiter fetch error: ${e.message.slice(0, 50)}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
-          await new Promise(r => setTimeout(r, wait));
-          break;
-        }
-        throw e;
-      }
-    }
-    // If all endpoints tried and none worked, wait before retry
-    if (attempt < maxRetries - 1) {
-      await new Promise(r => setTimeout(r, 2000));
-    }
-  }
-  return null;
-}
-
-// ─── Build Jupiter Swap Tx ────────────────────
-async function buildSwapTx(inputMint, outputMint, amount, isExactOut = false) {
+// ─── Build Jupiter Swap Tx (via SDK) ───────────
+async function buildSwapTx(inputMint, outputMint, amount) {
   try {
-    // For SELLING tokens: amount is already in human units, need smallest units
-    // For BUYING with SOL: amount is in SOL, convert to lamports
     const isSolInput = inputMint === 'So11111111111111111111111111111111111111112';
-    let amountLamports;
-    if (isSolInput) {
-      amountLamports = Math.floor(amount * solanaWeb3.LAMPORTS_PER_SOL);
-    } else {
-      // Token output — we already have it in token units, but need to figure out decimals
-      // Use 1M as base and let Jupiter route
-      amountLamports = Math.floor(amount * 1000000);
-    }
+    const amountLamports = isSolInput
+      ? Math.floor(amount * solanaWeb3.LAMPORTS_PER_SOL)
+      : Math.floor(amount * 1000000);
 
     const slippageBps = Math.floor(config.slippage * 100);
 
-    // Quote
-    const quoteParams = new URLSearchParams({
+    // 1. Get quote via SDK
+    const quote = await jupiterClient.quoteGet({
       inputMint,
       outputMint,
-      amount: String(amountLamports),
-      slippageBps: String(slippageBps),
-      feeBps: '0',
-      onlyDirectRoutes: 'false',
+      amount: amountLamports,
+      slippageBps,
+      feeBps: 0,
+      onlyDirectRoutes: false,
     });
-    if (isExactOut) quoteParams.set('swapMode', 'ExactOut');
-
-    const quoteResp = await jupiterFetch(`${config.jupiterApi}/quote?${quoteParams}`);
-    if (!quoteResp || !quoteResp.ok) {
-      const text = quoteResp ? await quoteResp.text() : 'no response';
-      log.warn(`Jupiter quote failed: ${text.slice(0,150)}`);
+    if (!quote || !quote.outAmount) {
+      log.warn('Jupiter quote failed: no route available');
       return null;
     }
-    const quote = await quoteResp.json();
 
-    // Swap instructions
-    const swapResp = await jupiterFetch(`${config.jupiterApi}/swap-instructions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
+    // 2. Get swap instructions via SDK
+    const swapResult = await jupiterClient.swapInstructionsPost({
+      swapRequest: {
         quoteResponse: quote,
         userPublicKey: walletAddress,
         wrapAndUnwrapSol: true,
@@ -298,24 +209,22 @@ async function buildSwapTx(inputMint, outputMint, amount, isExactOut = false) {
           computeUnitLimit: 200000,
           priorityLevel: 'veryHigh',
         },
-      }),
+      },
     });
-    if (!swapResp || !swapResp.ok) {
-      const text = swapResp ? await swapResp.text() : 'no response';
-      log.warn(`Jupiter swap-instructions failed: ${text.slice(0,150)}`);
+    if (!swapResult || !swapResult.swapTransaction) {
+      log.warn('Jupiter swap-instructions failed');
       return null;
     }
-    const swapData = await swapResp.json();
 
-    // Reconstruct transaction
+    // 3. Reconstruct transaction
     const tx = solanaWeb3.VersionedTransaction.deserialize(
-      Buffer.from(swapData.swapTransaction, 'base64')
+      Buffer.from(swapResult.swapTransaction, 'base64')
     );
     tx.sign([walletKeypair]);
 
     return { tx, quote };
   } catch (e) {
-    log.error('buildSwapTx error:', e.message);
+    log.error('buildSwapTx error:', e.message.slice(0,100));
     return null;
   }
 }
@@ -504,7 +413,7 @@ async function monitorPosition(mintAddress, position) {
     }
 
     // Get current position value
-    const currentValueUsd = await getPositionValueUsd(mintAddress, tokenBal.amount);
+    const currentValueUsd = await getTokenValueUsd(mintAddress, tokenBal.amount);
     if (currentValueUsd <= 0) return;
 
     const entryValueUsd = position.entrySol * _cachedSolPrice;
