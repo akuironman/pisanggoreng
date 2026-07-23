@@ -136,10 +136,10 @@ async function getTokenPrice(mintAddress) {
   try {
     const WSOL = 'So11111111111111111111111111111111111111112';
     // Quote 1M lamports worth — using 0.001 SOL equivalent (harder for very cheap tokens)
-    const resp = await fetch(
+    const resp = await jupiterFetch(
       `${config.jupiterApi}/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=10000&slippageBps=${config.slippage * 100}`
     );
-    if (!resp.ok) return null;
+    if (!resp || !resp.ok) return null;
     const data = await resp.json();
     if (!data || !data.outAmount) return null;
 
@@ -161,10 +161,10 @@ async function getPositionValueUsd(mintAddress, tokenAmount) {
     const WSOL = 'So11111111111111111111111111111111111111112';
     // Use slightly more for accuracy
     const inputAmount = Math.max(1, Math.floor(tokenAmount * 1000000));
-    const resp = await fetch(
+    const resp = await jupiterFetch(
       `${config.jupiterApi}/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=${inputAmount}&slippageBps=${config.slippage * 100}`
     );
-    if (!resp.ok) return 0;
+    if (!resp || !resp.ok) return 0;
     const data = await resp.json();
     if (!data || !data.outAmount) return 0;
 
@@ -184,14 +184,45 @@ let _lastSolPriceFetch = 0;
 async function getSolPrice() {
   if (Date.now() - _lastSolPriceFetch < 30000) return _cachedSolPrice;
   try {
-    const resp = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd');
-    if (resp.ok) {
+    const resp = await jupiterFetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {}, 2);
+    if (resp && resp.ok) {
       const data = await resp.json();
       _cachedSolPrice = data.solana.usd;
       _lastSolPriceFetch = Date.now();
     }
   } catch (e) {}
   return _cachedSolPrice;
+}
+
+// ─── Jupiter Fetch with Retry ──────────────────
+async function jupiterFetch(url, options = {}, maxRetries = 3) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const resp = await fetch(url, options);
+      if (resp.status === 429) {
+        const wait = Math.min(1000 * Math.pow(2, attempt), 8000);
+        log.warn(`🌐 Jupiter 429 rate limited, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      if (!resp.ok && resp.status >= 500) {
+        const wait = 2000;
+        log.warn(`🌐 Jupiter ${resp.status}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      return resp;
+    } catch (e) {
+      if (attempt < maxRetries - 1) {
+        const wait = 2000;
+        log.warn(`🌐 Jupiter fetch error: ${e.message.slice(0, 60)}, retry ${attempt + 1}/${maxRetries} in ${wait}ms`);
+        await new Promise(r => setTimeout(r, wait));
+        continue;
+      }
+      throw e;
+    }
+  }
+  return null;
 }
 
 // ─── Build Jupiter Swap Tx ────────────────────
@@ -222,16 +253,16 @@ async function buildSwapTx(inputMint, outputMint, amount, isExactOut = false) {
     });
     if (isExactOut) quoteParams.set('swapMode', 'ExactOut');
 
-    const quoteResp = await fetch(`${config.jupiterApi}/quote?${quoteParams}`);
-    if (!quoteResp.ok) {
-      const text = await quoteResp.text();
-      log.warn(`Jupiter quote failed (${quoteResp.status}): ${text.slice(0,200)}`);
+    const quoteResp = await jupiterFetch(`${config.jupiterApi}/quote?${quoteParams}`);
+    if (!quoteResp || !quoteResp.ok) {
+      const text = quoteResp ? await quoteResp.text() : 'no response';
+      log.warn(`Jupiter quote failed: ${text.slice(0,150)}`);
       return null;
     }
     const quote = await quoteResp.json();
 
     // Swap instructions
-    const swapResp = await fetch(`${config.jupiterApi}/swap-instructions`, {
+    const swapResp = await jupiterFetch(`${config.jupiterApi}/swap-instructions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -245,7 +276,11 @@ async function buildSwapTx(inputMint, outputMint, amount, isExactOut = false) {
         },
       }),
     });
-    if (!swapResp.ok) return null;
+    if (!swapResp || !swapResp.ok) {
+      const text = swapResp ? await swapResp.text() : 'no response';
+      log.warn(`Jupiter swap-instructions failed: ${text.slice(0,150)}`);
+      return null;
+    }
     const swapData = await swapResp.json();
 
     // Reconstruct transaction
@@ -597,11 +632,22 @@ async function startTokenDetector() {
             logStr.includes('initialize2') ||
             logStr.includes('Program log: initialize')) {
 
-          // Extract mint
+          // Extract mint — filter out known non-token addresses
           const mintMatch = logStr.match(/([1-9A-HJ-NP-Za-km-z]{32,44})/);
           if (!mintMatch) return;
 
           const potentialMint = mintMatch[1];
+          // Block non-token addresses
+          const knownNonTokens = [
+            '11111111111111111111111111111111',    // System Program
+            'So11111111111111111111111111111111111111112', // WSOL
+            'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // Token Program
+            'ATokenGPvbdGVxr1b2hvZbsiqW5xr25ix9fJf9WjJvdEG', // ATA Program
+            'ComputeBudget111111111111111111111111111111', // Compute Budget
+          ];
+          if (knownNonTokens.includes(potentialMint)) return;
+          // Also filter: must not start with all-1 pattern
+          if (/^1{10,}/.test(potentialMint)) return;
           const eventKey = `${ctx.slot}-${potentialMint}`;
 
           // DEDUP — skip if we already processed this event

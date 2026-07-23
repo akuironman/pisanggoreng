@@ -11,6 +11,30 @@ class AntiScam {
   }
 
   /**
+   * Fetch with retry — avoids 429 on Jupiter API
+   */
+  async _fetchWithRetry(url, maxRetries = 3) {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const resp = await fetch(url);
+        if (resp.status === 429) {
+          const wait = Math.min(1000 * Math.pow(2, attempt), 5000);
+          await new Promise(r => setTimeout(r, wait));
+          continue;
+        }
+        return resp;
+      } catch (e) {
+        if (attempt < maxRetries - 1) {
+          await new Promise(r => setTimeout(r, 2000));
+          continue;
+        }
+        throw e;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Full scan — run all checks before buying
    * Returns { pass: bool, reason: string }
    */
@@ -99,10 +123,10 @@ class AntiScam {
     try {
       const WSOL = 'So11111111111111111111111111111111111111112';
       // Try a tiny 0.001 SOL buy quote — if it returns, there's some liquidity
-      const resp = await fetch(
+      const resp = await this._fetchWithRetry(
         `https://quote-api.jup.ag/v6/quote?inputMint=${WSOL}&outputMint=${mintAddress}&amount=1000000&slippageBps=1500`
       );
-      if (!resp.ok) return { pass: false, reason: 'No route / liquidity (Jupiter returned ' + resp.status + ')' };
+      if (!resp || !resp.ok) return { pass: false, reason: 'No route / liquidity (Jupiter returned ' + (resp ? resp.status : 'timeout') + ')' };
       const data = await resp.json();
       if (!data || !data.outAmount || parseFloat(data.outAmount) <= 0) {
         return { pass: false, reason: 'Zero output — no liquidity' };
@@ -145,10 +169,10 @@ class AntiScam {
     try {
       const WSOL = 'So11111111111111111111111111111111111111112';
       // Tiny sell: 0.000001 token
-      const resp = await fetch(
+      const resp = await this._fetchWithRetry(
         `https://quote-api.jup.ag/v6/quote?inputMint=${mintAddress}&outputMint=${WSOL}&amount=1&slippageBps=1500`
       );
-      if (!resp.ok) return { pass: false, reason: 'Sell quote failed — possible honeypot' };
+      if (!resp || !resp.ok) return { pass: false, reason: 'Sell quote failed — possible honeypot' };
       const data = await resp.json();
       if (!data || !data.outAmount || parseFloat(data.outAmount) <= 0) {
         return { pass: false, reason: 'Sell returns 0 SOL — honeypot suspected' };
