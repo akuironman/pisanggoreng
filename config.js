@@ -44,6 +44,12 @@ const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
 
+  // ─── Curve Tracker ────────────────────────────
+  enableCurveTracker: process.env.ENABLE_CURVE_TRACKER !== 'false',
+  curveTargetProgress: parseFloat(process.env.CURVE_TARGET_PROGRESS || '10'),
+  curveCheckInterval: parseInt(process.env.CURVE_CHECK_INTERVAL || '3000'),
+  curveMaxWaitMs: parseInt(process.env.CURVE_MAX_WAIT_MS || '120000'),
+
   // ─── Jito ────────────────────────────────────
   enableJito: process.env.ENABLE_JITO === 'true',
   jitoTipAmount: parseFloat(process.env.JITO_TIP_AMOUNT || '0.0001'),

@@ -10,6 +10,7 @@ const AntiScam = require('./anti-scam');
 const TelegramNotifier = require('./telegram');
 const JitoEngine = require('./jito');
 const RpcManager = require('./rpc-manager');
+const CurveTracker = require('./curve-tracker');
 
 // ─── bs58 — support both v5 (cjs) and v6 (esm) ──
 let bs58;
@@ -81,6 +82,16 @@ const jito = new JitoEngine({
   connection: connection,
   walletKeypair: walletKeypair,
   jupiterApi: config.jupiterApi,
+});
+
+// ─── Curve Tracker ─────────────────────────────
+const curveTracker = new CurveTracker({
+  connection,
+  rpcManager,
+  targetProgress: config.curveTargetProgress,
+  checkInterval: config.curveCheckInterval,
+  maxWaitMs: config.curveMaxWaitMs,
+  pumpProgramId: config.pumpProgramId,
 });
 
 // ─── State ────────────────────────────────────
@@ -343,6 +354,29 @@ async function buyToken(mintAddress) {
       log.success(`✅ Anti-scam passed: ${scanResult.reason}`);
     }
 
+    // ─── BONDING CURVE CHECK ─────────────────
+    if (config.enableCurveTracker) {
+      const curveResult = await curveTracker.shouldBuyNow(mintAddress);
+
+      if (!curveResult.buy) {
+        log.info(`⏳ Curve at ${curveResult.progress.toFixed(1)}% — waiting for ${config.curveTargetProgress}% target...`);
+
+        // Wait for target progress
+        const hitTarget = await curveTracker.waitForTargetProgress(
+          mintAddress,
+          async (mint, progress) => {
+            log.info(`🎯 Proceeding with buy (curve ${progress.toFixed(1)}%)`);
+            // The actual buy happens after waitForTargetProgress resolves
+          },
+          (pollResult) => {
+            // Optional: log each poll
+          }
+        );
+      } else {
+        log.info(`✅ Curve at ${curveResult.progress.toFixed(1)}% — buying now`);
+      }
+    }
+
     // Check SOL balance
     const solBalance = await getSolBalance();
     const needed = config.buyAmountSol * 1.05;
@@ -572,6 +606,7 @@ async function startTokenDetector() {
   log.info(`🛡️ Anti-scam: ${config.enableAntiScam ? 'ON' : 'OFF'}`);
   log.info(`📱 Telegram: ${config.telegramEnabled ? 'ON' : 'OFF'}`);
   log.info(`⚡ Jito Bundle: ${config.enableJito ? 'ON' : 'OFF'}${config.enableJito ? ` (tip: ${config.jitoTipAmount} SOL)` : ''}`);
+  log.info(`📊 Curve Tracker: ${config.enableCurveTracker ? `ON (target ${config.curveTargetProgress}%)` : 'OFF'}`);
   log.info(`💸 Buy amount: ${config.buyAmountSol} SOL`);
   log.info(`⏱️  Cooldown: ${config.cooldownMs}ms`);
   log.info('─────────────────────────────────────────');
