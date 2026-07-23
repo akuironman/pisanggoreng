@@ -4,12 +4,28 @@
 // ============================================
 const solanaWeb3 = require('@solana/web3.js');
 const { getAssociatedTokenAddress } = require('@solana/spl-token');
-const bs58 = require('bs58');
 const config = require('./config');
 const AntiScam = require('./anti-scam');
 const TelegramNotifier = require('./telegram');
 const JitoEngine = require('./jito');
-// Node 22 built-in fetch
+
+// ─── bs58 — support both v5 (cjs) and v6 (esm) ──
+let bs58;
+try {
+  bs58 = require('bs58');
+} catch (_) {
+  // Fallback: use Buffer-based base58
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  bs58 = {
+    decode: (s) => {
+      let n = 0n;
+      for (const c of s) n = n * 58n + BigInt(alphabet.indexOf(c));
+      const b = [];
+      while (n > 0n) { b.unshift(Number(n & 0xffn)); n >>= 8n; }
+      return Buffer.from(b);
+    }
+  };
+}
 
 // ─── Logger ───────────────────────────────────
 const LOG_LEVELS = { error: 0, warn: 1, info: 2, debug: 3 };

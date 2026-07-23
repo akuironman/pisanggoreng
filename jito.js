@@ -4,7 +4,22 @@
 // Sends txs via Jito Block Engine — bypasses
 // public mempool, no frontrun, no sandwich
 // ============================================
-const bs58 = require('bs58');
+// ─── bs58 — support both v5 (cjs) and v6 (esm) ──
+let bs58;
+try {
+  bs58 = require('bs58');
+} catch (_) {
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  bs58 = {
+    encode: (buf) => {
+      let n = 0n;
+      for (const b of Buffer.from(buf)) n = (n << 8n) + BigInt(b);
+      let s = '';
+      while (n > 0n) { s = alphabet[Number(n % 58n)] + s; n /= 58n; }
+      return s || '1';
+    }
+  };
+}
 const solanaWeb3 = require('@solana/web3.js');
 
 class JitoEngine {
