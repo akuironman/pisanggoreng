@@ -264,18 +264,18 @@ async function buildSwapTx(inputMint, outputMint, amount) {
 }
 
 /**
- * Convert a Jupiter SDK instruction object to TransactionInstruction
+ * Convert a Jupiter SDK instruction object to real TransactionInstruction
  */
 function toV0Instruction(jupInstruction) {
-  return {
+  return new solanaWeb3.TransactionInstruction({
     programId: new solanaWeb3.PublicKey(jupInstruction.programId),
-    accounts: (jupInstruction.accounts || []).map(acc => ({
+    keys: (jupInstruction.accounts || []).map(acc => ({
       pubkey: new solanaWeb3.PublicKey(acc.pubkey),
       isSigner: acc.isSigner || false,
       isWritable: acc.isWritable || false,
     })),
     data: Buffer.from(jupInstruction.data, 'base64'),
-  };
+  });
 }
 
 // ─── Execute Transaction ──────────────────────
