@@ -711,7 +711,7 @@ async function startTokenDetector() {
 
           log.info(`🔥 New token: ${potentialMint.slice(0,12)}... (slot ${ctx.slot})`);
 
-          if (!activePositions.has(potentialMint) && potentialMint !== 'So11111111111111111111111111111111111111112') {
+          if (!activePositions.has(potentialMint) && !pendingMints.has(potentialMint) && potentialMint !== 'So11111111111111111111111111111111111111112') {
             try {
               new solanaWeb3.PublicKey(potentialMint);
               await sleep(800);
@@ -761,6 +761,7 @@ async function startPollingDetector() {
           for (const tb of tx.meta.postTokenBalances) {
             if (tb.mint &&
                 !activePositions.has(tb.mint) &&
+                !pendingMints.has(tb.mint) &&
                 tb.mint !== 'So11111111111111111111111111111111111111112') {
               log.info(`🔍 [POLL] Found: ${tb.mint}`);
               await buyToken(tb.mint);
