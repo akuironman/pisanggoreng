@@ -8,6 +8,7 @@ const bs58 = require('bs58');
 const config = require('./config');
 const AntiScam = require('./anti-scam');
 const TelegramNotifier = require('./telegram');
+const JitoEngine = require('./jito');
 // Node 22 built-in fetch
 
 // ─── Logger ───────────────────────────────────
@@ -47,6 +48,16 @@ const telegram = new TelegramNotifier({
   botToken: config.telegramBotToken,
   chatId: config.telegramChatId,
   useMarkdown: true,
+});
+
+// ─── Jito Bundle Engine ───────────────────────
+const jito = new JitoEngine({
+  enabled: config.enableJito,
+  tipAmount: config.jitoTipAmount,
+  blockEngineUrl: config.jitoBlockEngine,
+  connection: connection,
+  walletKeypair: walletKeypair,
+  jupiterApi: config.jupiterApi,
 });
 
 // ─── State ────────────────────────────────────
@@ -233,6 +244,19 @@ async function buildSwapTx(inputMint, outputMint, amount, isExactOut = false) {
 
 // ─── Execute Transaction ──────────────────────
 async function executeTx(tx, label = 'tx') {
+  // ─── JITO BUNDLE PATH ─────────────────────
+  if (config.enableJito) {
+    log.debug(`${label}: Trying Jito bundle...`);
+    const bundleResult = await jito.sendSwapBundle(tx, label);
+    if (bundleResult && bundleResult.confirmed) {
+      const sig = bundleResult.txSignatures?.[0] || bundleResult;
+      log.success(`✅ Jito: ${label} landed via bundle`);
+      return typeof sig === 'string' ? sig : bundleResult;
+    }
+    log.warn(`${label}: Jito bundle failed, falling back to regular send...`);
+  }
+
+  // ─── REGULAR SEND PATH ────────────────────
   try {
     const sig = await connection.sendTransaction(tx, {
       skipPreflight: false,
@@ -511,6 +535,7 @@ async function startTokenDetector() {
   }
   log.info(`🛡️ Anti-scam: ${config.enableAntiScam ? 'ON' : 'OFF'}`);
   log.info(`📱 Telegram: ${config.telegramEnabled ? 'ON' : 'OFF'}`);
+  log.info(`⚡ Jito Bundle: ${config.enableJito ? 'ON' : 'OFF'}${config.enableJito ? ` (tip: ${config.jitoTipAmount} SOL)` : ''}`);
   log.info(`💸 Buy amount: ${config.buyAmountSol} SOL`);
   log.info(`⏱️  Cooldown: ${config.cooldownMs}ms`);
   log.info('─────────────────────────────────────────');

@@ -40,6 +40,11 @@ const config = {
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || '',
   telegramChatId: process.env.TELEGRAM_CHAT_ID || '',
 
+  // ─── Jito ────────────────────────────────────
+  enableJito: process.env.ENABLE_JITO === 'true',
+  jitoTipAmount: parseFloat(process.env.JITO_TIP_AMOUNT || '0.0001'),
+  jitoBlockEngine: process.env.JITO_BLOCK_ENGINE || 'https://mainnet.block-engine.jito.wtf',
+
   // ─── Log ─────────────────────────────────────
   logLevel: process.env.LOG_LEVEL || 'info',
 
