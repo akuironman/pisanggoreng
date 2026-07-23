@@ -334,6 +334,19 @@ async function executeTx(tx, label = 'tx') {
 // ─── BUY ──────────────────────────────────────
 async function buyToken(mintAddress) {
   try {
+    // ─── MAX 1 POSITION ──────────────────────
+    if (config.maxOnePosition) {
+      // Count non-sold positions
+      let activeCount = 0;
+      for (const [, pos] of activePositions) {
+        if (!pos.sold) activeCount++;
+      }
+      if (activeCount >= 1) {
+        log.info(`⏭️ Max 1 position active (${activeCount}) — skipping ${mintAddress.slice(0,12)}...`);
+        return false;
+      }
+    }
+
     // Cooldown check
     if (Date.now() - lastTradeTime < config.cooldownMs) {
       const wait = config.cooldownMs - (Date.now() - lastTradeTime);

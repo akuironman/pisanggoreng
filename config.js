@@ -26,6 +26,7 @@ const config = {
   // ─── Trading ─────────────────────────────────
   buyAmountSol: parseFloat(process.env.BUY_AMOUNT_SOL || '0.01'),
   cooldownMs: parseInt(process.env.COOLDOWN_MS || '2000'),
+  maxOnePosition: process.env.MAX_ONE_POSITION !== 'false',
 
   // ─── TP / SL / Partial ───────────────────────
   tpUsd: parseFloat(process.env.TP_USD || '5.00'),
