@@ -723,7 +723,7 @@ async function startTokenDetector() {
             '11111111111111111111111111111111',    // System Program
             'So11111111111111111111111111111111111111112', // WSOL
             'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // Token Program
-            'ATokenGPvbdGVxr1b2hvZbsiqW5xr25ix9fJf9WjJvdEG', // ATA Program
+            'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', // ATA Program
             'ComputeBudget111111111111111111111111111111', // Compute Budget
             '6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P', // Pump.fun Program
             '675kPX9MHTjS2zt1i4bBcGvjgL2LzV3FKJ',            // Raydium V4
